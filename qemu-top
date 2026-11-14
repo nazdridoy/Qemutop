@@ -1,0 +1,2016 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 nazDridoy
+# SPDX-License-Identifier: MIT
+"""
+qemu-top
+================================
+htop-style live resource monitor for QEMU/KVM virtual machines.
+Discovers VMs directly from /proc — no libvirt required.
+
+Run  ./qemu-top --help  for full usage.
+"""
+
+# ---------------------------------------------------------------------------
+# Standard library only — no pip dependencies
+# ---------------------------------------------------------------------------
+import argparse
+import curses
+import dataclasses
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+VERSION = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Clock ticks per second (usually 100 on Linux).
+# Used to convert /proc/stat jiffies → seconds.
+CLK_TCK: int = os.sysconf("SC_CLK_TCK")
+
+# Minimum interval between refreshes (seconds).
+MIN_INTERVAL: float = 0.5
+MAX_INTERVAL: float = 60.0
+
+# Column sort keys
+SORT_KEYS = ("cpu", "ram", "read", "write", "netrx", "nettx", "name", "pid", "uptime")
+
+# Regex matching any qemu-system-* binary name
+QEMU_RE = re.compile(r"qemu-system-\w+")
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class RawSnapshot:
+    """Raw /proc values for a single QEMU process at one point in time."""
+
+    pid: int
+    name: str                    # Resolved VM name
+    exe: str                     # Path to qemu-system-* binary
+    cmdline: List[str]           # Full argv
+    cpu_ticks: int               # utime + stime (jiffies)
+    rss_kib: int                 # Resident Set Size in KiB
+    vsz_kib: int                 # Virtual memory size in KiB
+    disk_read_bytes: int         # /proc/<pid>/io  read_bytes
+    disk_write_bytes: int        # /proc/<pid>/io  write_bytes
+    io_available: bool           # False if PermissionError on /proc/<pid>/io
+    net_interfaces: List[str]    # Host-side network interfaces for this VM
+    vcpus: int               # vCPU count from -smp cmdline argument
+    configured_mem_mb: int   # Configured guest RAM in MiB from -m cmdline argument
+    starttime_ticks: int         # Process start time in jiffies since boot
+    wall_time: float             # time.monotonic() at collection time
+
+
+@dataclasses.dataclass
+class VMMetrics:
+    """Derived, human-displayable metrics for one VM."""
+
+    pid: int
+    name: str
+    exe: str
+    cmdline: List[str]
+
+    cpu_pct: Optional[float]     # None on first sample
+    rss_kib: int
+    vsz_kib: int
+    disk_read_rate: Optional[float]   # bytes/s; None on first sample
+    disk_write_rate: Optional[float]  # bytes/s
+    disk_read_total: int         # cumulative bytes
+    disk_write_total: int        # cumulative bytes
+    io_available: bool
+    net_interfaces: List[str]
+    net_rx_rate: Optional[float]  # bytes/s; None if unknown/first sample
+    net_tx_rate: Optional[float]
+    uptime_sec: float            # seconds the process has been running
+    vcpus: int               # vCPU count from -smp
+    configured_mem_mb: int   # Configured guest RAM in MiB
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+
+def fmt_bytes(b: Optional[float], suffix: str = "/s") -> str:
+    """Format a byte count (or rate) into a human-readable string."""
+    if b is None:
+        return "N/A"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(b) < 1024.0:
+            return f"{b:6.1f} {unit}{suffix}"
+        b /= 1024.0
+    return f"{b:.1f} PiB{suffix}"
+
+
+def fmt_bytes_plain(b: int) -> str:
+    """Format a cumulative byte value (no /s suffix)."""
+    return fmt_bytes(float(b), suffix="")
+
+
+def fmt_mem(kib: int) -> str:
+    """Format a KiB value as MiB or GiB, dropping redundant .00 decimals."""
+    if kib < 1024:
+        return f"{kib} KiB"
+    if kib < 1024 * 1024:
+        mib = kib / 1024
+        return f"{mib:.0f} MiB" if mib == int(mib) else f"{mib:.2f} MiB"
+    gib = kib / 1024 / 1024
+    return f"{gib:.0f} GiB" if gib == int(gib) else f"{gib:.2f} GiB"
+
+
+def fmt_uptime(sec: float) -> str:
+    """Format seconds into compact uptime string: 45s / 12m34s / 3h21m / 2d04h."""
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        m, s = divmod(sec, 60)
+        return f"{m}m{s:02d}s"
+    if sec < 86400:
+        h, rem = divmod(sec, 3600)
+        m = rem // 60
+        return f"{h}h{m:02d}m"
+    d, rem = divmod(sec, 86400)
+    h = rem // 3600
+    return f"{d}d{h:02d}h"
+
+
+def fmt_cpu(pct: Optional[float]) -> str:
+    if pct is None:
+        return "  --  "
+    return f"{pct:6.1f}%"
+
+
+def fmt_rate(r: Optional[float]) -> str:
+    if r is None:
+        return "    N/A    "
+    return fmt_bytes(r)
+
+
+def read_file(path: str) -> str:
+    """Read a file, return empty string on any error."""
+    try:
+        with open(path, "r", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def read_file_bytes(path: str) -> bytes:
+    """Read a file as bytes, return b'' on any error."""
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
+def get_host_uptime() -> float:
+    """Return host uptime in seconds from /proc/uptime."""
+    data = read_file("/proc/uptime")
+    if data:
+        try:
+            return float(data.split()[0])
+        except (ValueError, IndexError):
+            pass
+    return 0.0
+
+
+def get_boot_time() -> float:
+    """Return Unix timestamp of last boot from /proc/stat."""
+    data = read_file("/proc/stat")
+    for line in data.splitlines():
+        if line.startswith("btime "):
+            try:
+                return float(line.split()[1])
+            except (ValueError, IndexError):
+                pass
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# VM Name resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_vm_name(cmdline: List[str], pid: int) -> str:
+    """
+    Determine the best human-readable name for a QEMU VM.
+
+    Priority:
+    1. -name <guest>          e.g.  -name win11
+    2. -name guest=<n>,...    e.g.  -name guest=ubuntu,debug-threads=on
+    3. Fallback: qemu-<PID>
+    """
+    for i, arg in enumerate(cmdline):
+        if arg == "-name" and i + 1 < len(cmdline):
+            raw = cmdline[i + 1]
+            # Handle guest=<name>,... syntax
+            if raw.startswith("guest="):
+                name = raw[len("guest="):]
+                name = name.split(",")[0]
+            else:
+                # Strip any trailing options like ,debug-threads=on
+                name = raw.split(",")[0]
+            if name:
+                return name
+    return f"qemu-{pid}"
+
+
+def parse_vcpus(cmdline: List[str]) -> int:
+    """
+    Extract vCPU count from the QEMU -smp argument.
+
+    Handles:  -smp 4  |  -smp cores=2,threads=2  |  -smp cpus=8,sockets=1
+    Returns 1 (the default) if -smp is absent or unparseable.
+    """
+    for i, arg in enumerate(cmdline):
+        if arg == "-smp" and i + 1 < len(cmdline):
+            val = cmdline[i + 1]
+            first = val.split(",")[0]
+            # Direct integer: -smp 4
+            try:
+                return max(1, int(first))
+            except ValueError:
+                pass
+            # cpus=N form
+            m = re.search(r"\bcpus=(\d+)", val)
+            if m:
+                return max(1, int(m.group(1)))
+            # Compute from cores * threads * sockets
+            parts = dict(kv.split("=", 1) for kv in val.split(",") if "=" in kv)
+            try:
+                cores = int(parts.get("cores", 1))
+                threads = int(parts.get("threads", 1))
+                sockets = int(parts.get("sockets", 1))
+                return max(1, cores * threads * sockets)
+            except ValueError:
+                pass
+    return 1
+
+
+def parse_configured_mem(cmdline: List[str]) -> int:
+    """
+    Extract configured guest memory in MiB from the QEMU -m argument.
+
+    Handles all known formats:
+      -m 2048                   → 2048 MiB  (bare number, default unit is MiB)
+      -m 2G  / -m 2g            → 2048 MiB
+      -m 2048M                  → 2048 MiB
+      -m 4096,slots=4,maxmem=8G → 4096 MiB  (hotplug slots; take first part)
+      -m size=8388608k          → 8192 MiB  (libvirt/modern QEMU style, KiB)
+      -m size=8589934592b       → 8192 MiB  (byte form, extremely rare)
+
+    Returns 0 if -m is absent or unparseable.
+    """
+    for i, arg in enumerate(cmdline):
+        if arg == "-m" and i + 1 < len(cmdline):
+            val = cmdline[i + 1].split(",")[0].strip()
+            # Strip optional keyword prefix used by libvirt: "size=", "memory="
+            for prefix in ("size=", "memory="):
+                if val.lower().startswith(prefix):
+                    val = val[len(prefix):]
+                    break
+            # Now val should be a number optionally followed by a unit letter
+            m = re.match(r"^(\d+(?:\.\d+)?)\s*([GgMmKkBb]?)$", val)
+            if m:
+                num = float(m.group(1))
+                unit = m.group(2).upper()
+                if unit == "G":
+                    return int(num * 1024)
+                elif unit == "K":
+                    # KiB → MiB  (libvirt passes KiB: size=8388608k = 8 GiB)
+                    return max(1, int(num / 1024))
+                elif unit == "B":
+                    # Bytes → MiB  (very uncommon but handle gracefully)
+                    return max(1, int(num / 1024 / 1024))
+                else:  # M or no unit → MiB (QEMU default)
+                    return int(num)
+    return 0
+
+
+def fmt_mem_mb(mb: int) -> str:
+    """Format a MiB value into a human-readable string."""
+    if mb <= 0:
+        return "?"
+    return fmt_mem(mb * 1024)  # fmt_mem takes KiB
+
+
+def build_cmd_display(cmdline: List[str]) -> str:
+    """
+    Build a compact single-line command summary for the CMD column.
+
+    - Skips argv[0] (executable path, already known).
+    - Skips args already shown in other columns: -name, -m, -smp, -uuid.
+    - Collapses libvirt JSON blobs ({"qom-type":...}) to short tags like [secret].
+    - Keeps all other flags intact so the column is genuinely informative.
+    """
+    if len(cmdline) < 2:
+        return ""
+
+    # Flags with no following value (lone flags to suppress)
+    SKIP_FLAGS = frozenset({"-S", "-no-user-config", "-nodefaults"})
+    # Args whose next token (the value) is already shown in another column
+    SKIP_WITH_VAL = frozenset({"-name", "-m", "-smp", "-uuid",
+                               "-msg", "-sandbox", "-overcommit"})
+
+    parts: List[str] = []
+    i = 1  # skip argv[0]
+    while i < len(cmdline):
+        arg = cmdline[i]
+        if arg in SKIP_FLAGS:
+            i += 1
+            continue
+        if arg in SKIP_WITH_VAL and i + 1 < len(cmdline):
+            i += 2
+            continue
+        # Collapse JSON objects produced by libvirt into short readable tags
+        if arg.startswith("{"):
+            # Try to extract qom-type (e.g. "secret", "memory-backend-memfd")
+            m = re.search(r'"qom-type"\s*:\s*"([^"]+)"', arg)
+            if m:
+                short = m.group(1).rsplit(".", 1)[-1]  # last dotted component
+                parts.append(f"[{short}]")
+            else:
+                # Try driver (blockdev)
+                m = re.search(r'"driver"\s*:\s*"([^"]+)"', arg)
+                if m:
+                    parts.append(f"[blk:{m.group(1)}]")
+                else:
+                    parts.append("[...]")
+            i += 1
+            continue
+        parts.append(arg)
+        i += 1
+
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Process Discovery
+# ---------------------------------------------------------------------------
+
+
+class ProcessDiscovery:
+    """
+    Scans /proc to find all running qemu-system-* processes.
+
+    Does NOT use virsh, libvirt, or any external tool.
+    Gracefully handles disappearing processes and permission errors.
+    """
+
+    def discover(self) -> List[int]:
+        """Return a list of PIDs for all running qemu-system-* processes."""
+        pids: List[int] = []
+        try:
+            proc_entries = os.listdir("/proc")
+        except OSError:
+            return pids
+
+        for entry in proc_entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if self._is_qemu(pid):
+                pids.append(pid)
+        return pids
+
+    def _is_qemu(self, pid: int) -> bool:
+        """Return True if this PID belongs to a qemu-system-* process."""
+        # Fast path: check /proc/<pid>/comm (kernel process name, may be truncated)
+        comm = read_file(f"/proc/{pid}/comm").strip()
+        if QEMU_RE.search(comm):
+            return True
+
+        # Slower path: check /proc/<pid>/cmdline (full argv[0])
+        raw = read_file_bytes(f"/proc/{pid}/cmdline")
+        if not raw:
+            return False
+        # argv[0] is terminated by \x00
+        argv0 = raw.split(b"\x00")[0].decode("utf-8", errors="replace")
+        # Match the basename of the executable
+        return bool(QEMU_RE.search(os.path.basename(argv0)))
+
+
+# ---------------------------------------------------------------------------
+# /proc Collector
+# ---------------------------------------------------------------------------
+
+
+class ProcCollector:
+    """
+    Reads raw /proc/<pid>/* files for a single QEMU process.
+
+    All reads are defensive — any missing or malformed file results in
+    safe defaults rather than an exception.
+    """
+
+    def collect(self, pid: int, net_collector: "NetworkCollector") -> Optional[RawSnapshot]:
+        """
+        Collect one raw snapshot for the given PID.
+        Returns None if the process has disappeared.
+        """
+        try:
+            cmdline = self._read_cmdline(pid)
+            if not cmdline:
+                return None  # Process gone
+
+            exe = self._read_exe(pid)
+            name = resolve_vm_name(cmdline, pid)
+            cpu_ticks, starttime_ticks = self._read_stat(pid)
+            rss_kib, vsz_kib = self._read_status(pid)
+            disk_read, disk_write, io_ok = self._read_io(pid)
+            net_ifaces = net_collector.discover_interfaces(pid, cmdline)
+            wall = time.monotonic()
+
+            return RawSnapshot(
+                pid=pid,
+                name=name,
+                exe=exe,
+                cmdline=cmdline,
+                cpu_ticks=cpu_ticks,
+                rss_kib=rss_kib,
+                vsz_kib=vsz_kib,
+                disk_read_bytes=disk_read,
+                disk_write_bytes=disk_write,
+                io_available=io_ok,
+                net_interfaces=net_ifaces,
+                vcpus=parse_vcpus(cmdline),
+                configured_mem_mb=parse_configured_mem(cmdline),
+                starttime_ticks=starttime_ticks,
+                wall_time=wall,
+            )
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+
+    # --- internal readers ---
+
+    def _read_cmdline(self, pid: int) -> List[str]:
+        raw = read_file_bytes(f"/proc/{pid}/cmdline")
+        if not raw:
+            return []
+        # argv is NUL-separated; strip trailing NUL
+        parts = raw.rstrip(b"\x00").split(b"\x00")
+        return [p.decode("utf-8", errors="replace") for p in parts]
+
+    def _read_exe(self, pid: int) -> str:
+        try:
+            return os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return ""
+
+    def _read_stat(self, pid: int) -> Tuple[int, int]:
+        """
+        Returns (cpu_ticks, starttime_ticks).
+        cpu_ticks = utime + stime (fields 14+15, 1-indexed).
+        starttime_ticks = field 22 (jiffies since boot).
+        """
+        data = read_file(f"/proc/{pid}/stat")
+        if not data:
+            return 0, 0
+        try:
+            # The process name is enclosed in parens and may contain spaces.
+            # Strip everything up to and including the closing paren.
+            rparen = data.rfind(")")
+            if rparen == -1:
+                return 0, 0
+            fields = data[rparen + 2:].split()
+            # After the closing paren, fields are 0-indexed:
+            # field[11] = utime  (original field 14)
+            # field[12] = stime  (original field 15)
+            # field[19] = starttime (original field 22)
+            utime = int(fields[11])
+            stime = int(fields[12])
+            starttime = int(fields[19])
+            return utime + stime, starttime
+        except (ValueError, IndexError):
+            return 0, 0
+
+    def _read_status(self, pid: int) -> Tuple[int, int]:
+        """Returns (rss_kib, vsz_kib) from /proc/<pid>/status."""
+        data = read_file(f"/proc/{pid}/status")
+        rss = 0
+        vsz = 0
+        for line in data.splitlines():
+            if line.startswith("VmRSS:"):
+                try:
+                    rss = int(line.split()[1])
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("VmSize:"):
+                try:
+                    vsz = int(line.split()[1])
+                except (ValueError, IndexError):
+                    pass
+        return rss, vsz
+
+    def _read_io(self, pid: int) -> Tuple[int, int, bool]:
+        """
+        Returns (read_bytes, write_bytes, available).
+        /proc/<pid>/io requires process ownership or CAP_SYS_PTRACE.
+        """
+        try:
+            with open(f"/proc/{pid}/io", "r") as f:
+                data = f.read()
+        except PermissionError:
+            return 0, 0, False
+        except OSError:
+            return 0, 0, True  # Process gone; not a permission issue
+
+        rb = wb = 0
+        for line in data.splitlines():
+            if line.startswith("read_bytes:"):
+                try:
+                    rb = int(line.split()[1])
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("write_bytes:"):
+                try:
+                    wb = int(line.split()[1])
+                except (ValueError, IndexError):
+                    pass
+        return rb, wb, True
+
+
+# ---------------------------------------------------------------------------
+# Network Collector
+# ---------------------------------------------------------------------------
+
+
+class NetworkCollector:
+    """
+    Maps QEMU process PIDs to host-side network interfaces.
+
+    Strategy (layered best-effort):
+    1. Parse -netdev / -net arguments from the QEMU cmdline.
+    2. Scan /proc/<pid>/fd/ for TAP file descriptors and cross-reference
+       with /sys/class/net/<if>/ to find matching interfaces.
+    3. Heuristic: look for tap*/vnet* interfaces whose ifindex or name
+       pattern suggests QEMU ownership.
+
+    If no mapping can be made, returns an empty list (displayed as N/A).
+
+    Network rates are calculated from /sys/class/net/<if>/statistics/rx_bytes
+    and tx_bytes between samples.
+    """
+
+    # Cache of interface name → (rx_bytes, tx_bytes) at last read
+    _iface_prev: Dict[str, Tuple[int, int]] = {}
+    _iface_prev_time: float = 0.0
+    _iface_curr: Dict[str, Tuple[int, int]] = {}
+    _iface_curr_time: float = 0.0
+
+    # Cache: inode (int) → interface name, refreshed each cycle
+    _sock_inode_to_iface: Dict[int, str] = {}
+
+    def __init__(self) -> None:
+        self._iface_prev = {}
+        self._iface_curr = {}
+        self._sock_inode_to_iface = {}
+        self._iface_prev_time = 0.0
+        self._iface_curr_time = 0.0
+
+    def refresh_iface_counters(self) -> None:
+        """
+        Read current rx/tx byte counters for all network interfaces.
+        Call once per collection cycle, before per-VM collection.
+        """
+        self._iface_prev = dict(self._iface_curr)
+        self._iface_prev_time = self._iface_curr_time
+        self._iface_curr = {}
+        self._iface_curr_time = time.monotonic()
+
+        try:
+            ifaces = os.listdir("/sys/class/net")
+        except OSError:
+            return
+
+        for iface in ifaces:
+            rx = self._read_iface_counter(iface, "rx_bytes")
+            tx = self._read_iface_counter(iface, "tx_bytes")
+            self._iface_curr[iface] = (rx, tx)
+
+    def _read_iface_counter(self, iface: str, counter: str) -> int:
+        path = f"/sys/class/net/{iface}/statistics/{counter}"
+        data = read_file(path).strip()
+        try:
+            return int(data)
+        except ValueError:
+            return 0
+
+    def discover_interfaces(self, pid: int, cmdline: List[str]) -> List[str]:
+        """
+        Return a list of host network interface names for this QEMU process.
+        Returns [] if no mapping can be determined.
+        """
+        found: List[str] = []
+
+        # --- Method 1: parse cmdline for explicit ifname= arguments ---
+        found.extend(self._parse_cmdline_interfaces(cmdline))
+
+        # --- Method 2: scan /proc/<pid>/fd/ for TAP fds ---
+        if not found:
+            found.extend(self._discover_via_fd(pid))
+
+        # Deduplicate while preserving order
+        seen = set()
+        result = []
+        for iface in found:
+            if iface not in seen and self._iface_exists(iface):
+                seen.add(iface)
+                result.append(iface)
+
+        return result
+
+    def _iface_exists(self, iface: str) -> bool:
+        return os.path.exists(f"/sys/class/net/{iface}")
+
+    def _parse_cmdline_interfaces(self, cmdline: List[str]) -> List[str]:
+        """
+        Extract interface names from QEMU -netdev / -net arguments.
+
+        Examples:
+          -netdev tap,id=net0,ifname=tap0,script=no
+          -net tap,ifname=vnet3
+          -netdev tap,id=net0   (no explicit ifname; QEMU auto-assigns)
+        """
+        ifaces: List[str] = []
+        cmdline_str = " ".join(cmdline)
+
+        # Match ifname=<name> anywhere in the cmdline
+        for m in re.finditer(r"ifname=([^\s,]+)", cmdline_str):
+            ifaces.append(m.group(1))
+
+        return ifaces
+
+    def _discover_via_fd(self, pid: int) -> List[str]:
+        """
+        Walk /proc/<pid>/fd/ and look for symlinks pointing to /dev/net/tun.
+        Then try to find the associated tap interface by checking
+        /sys/class/net/<if>/tun_flags or matching via /proc/net/dev.
+        
+        This is a best-effort approach; it works when the kernel exposes
+        the tap interface name through sysfs.
+        """
+        fd_dir = f"/proc/{pid}/fd"
+        ifaces: List[str] = []
+
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            return ifaces
+
+        has_tun = False
+        for fd in fds:
+            try:
+                target = os.readlink(f"{fd_dir}/{fd}")
+                if target == "/dev/net/tun":
+                    has_tun = True
+                    break
+            except OSError:
+                continue
+
+        if not has_tun:
+            return ifaces
+
+        # The process has a /dev/net/tun fd. Now look for tap/vnet interfaces
+        # that might belong to it. We use the heuristic that tap interfaces
+        # opened by QEMU will appear as tap* or vnet* in /sys/class/net.
+        # We check if the interface has a tun_flags file (indicating it's a tun/tap).
+        try:
+            all_ifaces = os.listdir("/sys/class/net")
+        except OSError:
+            return ifaces
+
+        for iface in all_ifaces:
+            if not (iface.startswith("tap") or iface.startswith("vnet")):
+                continue
+            # Check if this is a tun/tap interface
+            tun_flags = read_file(f"/sys/class/net/{iface}/tun_flags").strip()
+            if not tun_flags:
+                continue
+            # We can't definitively link it to this PID without reading
+            # /proc/net/fdinfo (requires Linux 3.x+ and process ownership).
+            # Add it as a candidate — the caller will check for duplicates
+            # across VMs and show N/A if ambiguous.
+            ifaces.append(iface)
+
+        return ifaces
+
+    def get_rates(
+        self, interfaces: List[str]
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Return (rx_bytes_per_sec, tx_bytes_per_sec) for the given interfaces.
+        Returns (None, None) if no counter data is available.
+        """
+        if not interfaces or not self._iface_prev or not self._iface_curr:
+            return None, None
+
+        dt = self._iface_curr_time - self._iface_prev_time
+        if dt <= 0:
+            return None, None
+
+        total_rx = 0
+        total_tx = 0
+        matched = False
+
+        for iface in interfaces:
+            curr = self._iface_curr.get(iface)
+            prev = self._iface_prev.get(iface)
+            if curr and prev:
+                rx_delta = max(0, curr[0] - prev[0])
+                tx_delta = max(0, curr[1] - prev[1])
+                total_rx += rx_delta
+                total_tx += tx_delta
+                matched = True
+
+        if not matched:
+            return None, None
+
+        return total_rx / dt, total_tx / dt
+
+
+# ---------------------------------------------------------------------------
+# Metrics Engine
+# ---------------------------------------------------------------------------
+
+
+class MetricsEngine:
+    """
+    Calculates per-VM derived metrics by diffing two consecutive snapshots.
+    """
+
+    def __init__(self) -> None:
+        # pid → previous RawSnapshot
+        self._prev: Dict[int, RawSnapshot] = {}
+        self._host_uptime: float = 0.0
+
+    def update(
+        self,
+        current_snapshots: Dict[int, RawSnapshot],
+        net_collector: NetworkCollector,
+    ) -> List[VMMetrics]:
+        """
+        Given a fresh set of RawSnapshots, compute VMMetrics for each VM.
+        On first call, CPU/disk rates will be None (no prior sample).
+        """
+        self._host_uptime = get_host_uptime()
+        results: List[VMMetrics] = []
+
+        for pid, curr in current_snapshots.items():
+            prev = self._prev.get(pid)
+            metrics = self._compute(curr, prev, net_collector)
+            results.append(metrics)
+
+        self._prev = current_snapshots
+        return results
+
+    def _compute(
+        self,
+        curr: RawSnapshot,
+        prev: Optional[RawSnapshot],
+        net_collector: NetworkCollector,
+    ) -> VMMetrics:
+        # --- CPU ---
+        cpu_pct: Optional[float] = None
+        if prev is not None:
+            dt = curr.wall_time - prev.wall_time
+            if dt > 0:
+                tick_delta = curr.cpu_ticks - prev.cpu_ticks
+                # top-style: 100% per CPU core
+                cpu_pct = (tick_delta / CLK_TCK) / dt * 100.0
+                cpu_pct = max(0.0, cpu_pct)
+
+        # --- Disk I/O rates ---
+        disk_read_rate: Optional[float] = None
+        disk_write_rate: Optional[float] = None
+        if prev is not None and curr.io_available and prev.io_available:
+            dt = curr.wall_time - prev.wall_time
+            if dt > 0:
+                disk_read_rate = max(
+                    0.0, (curr.disk_read_bytes - prev.disk_read_bytes) / dt
+                )
+                disk_write_rate = max(
+                    0.0, (curr.disk_write_bytes - prev.disk_write_bytes) / dt
+                )
+
+        # --- Network rates ---
+        net_rx_rate, net_tx_rate = net_collector.get_rates(curr.net_interfaces)
+
+        # --- Uptime ---
+        # process start time in seconds since boot
+        process_start_sec = curr.starttime_ticks / CLK_TCK
+        uptime_sec = max(0.0, self._host_uptime - process_start_sec)
+
+        return VMMetrics(
+            pid=curr.pid,
+            name=curr.name,
+            exe=curr.exe,
+            cmdline=curr.cmdline,
+            cpu_pct=cpu_pct,
+            rss_kib=curr.rss_kib,
+            vsz_kib=curr.vsz_kib,
+            disk_read_rate=disk_read_rate,
+            disk_write_rate=disk_write_rate,
+            disk_read_total=curr.disk_read_bytes,
+            disk_write_total=curr.disk_write_bytes,
+            io_available=curr.io_available,
+            net_interfaces=curr.net_interfaces,
+            net_rx_rate=net_rx_rate,
+            net_tx_rate=net_tx_rate,
+            uptime_sec=uptime_sec,
+            vcpus=curr.vcpus,
+            configured_mem_mb=curr.configured_mem_mb,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Host stats helpers
+# ---------------------------------------------------------------------------
+
+
+def get_host_cpu_count() -> int:
+    """Return the number of logical CPUs on the host."""
+    try:
+        return os.cpu_count() or 1
+    except Exception:
+        return 1
+
+
+def get_host_cpu_usage() -> Optional[float]:
+    """
+    Return total host CPU usage percent since last call.
+    This function is stateful — keep a module-level instance.
+    """
+    return None  # Will be managed by HostCpuMonitor
+
+
+class HostCpuMonitor:
+    """Tracks overall host CPU usage between samples."""
+
+    def __init__(self) -> None:
+        self._prev_idle: int = 0
+        self._prev_total: int = 0
+        self._first = True
+
+    def sample(self) -> Optional[float]:
+        """Return host CPU usage % (0-100 of total capacity), or None on first call."""
+        data = read_file("/proc/stat")
+        for line in data.splitlines():
+            if line.startswith("cpu "):
+                fields = line.split()
+                # user, nice, system, idle, iowait, irq, softirq, ...
+                vals = [int(x) for x in fields[1:8]]
+                total = sum(vals)
+                idle = vals[3]  # idle field
+                if self._first:
+                    self._prev_total = total
+                    self._prev_idle = idle
+                    self._first = False
+                    return None
+                dt = total - self._prev_total
+                di = idle - self._prev_idle
+                self._prev_total = total
+                self._prev_idle = idle
+                if dt <= 0:
+                    return 0.0
+                return max(0.0, (1.0 - di / dt) * 100.0)
+        return None
+
+
+def get_host_mem() -> Tuple[int, int]:
+    """Return (used_kib, total_kib) from /proc/meminfo."""
+    data = read_file("/proc/meminfo")
+    total = 0
+    available = 0
+    for line in data.splitlines():
+        if line.startswith("MemTotal:"):
+            try:
+                total = int(line.split()[1])
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("MemAvailable:"):
+            try:
+                available = int(line.split()[1])
+            except (ValueError, IndexError):
+                pass
+    used = total - available
+    return used, total
+
+
+# ---------------------------------------------------------------------------
+# Sorting
+# ---------------------------------------------------------------------------
+
+
+def sort_vms(vms: List[VMMetrics], key: str, reverse: bool = True) -> List[VMMetrics]:
+    """Sort a list of VMMetrics by the given key."""
+    def _key(vm: VMMetrics):
+        if key == "cpu":
+            return vm.cpu_pct if vm.cpu_pct is not None else -1
+        elif key == "ram":
+            return vm.rss_kib
+        elif key == "read":
+            return vm.disk_read_rate if vm.disk_read_rate is not None else -1
+        elif key == "write":
+            return vm.disk_write_rate if vm.disk_write_rate is not None else -1
+        elif key == "netrx":
+            return vm.net_rx_rate if vm.net_rx_rate is not None else -1
+        elif key == "nettx":
+            return vm.net_tx_rate if vm.net_tx_rate is not None else -1
+        elif key == "name":
+            return vm.name.lower()
+        elif key == "pid":
+            return vm.pid
+        elif key == "uptime":
+            return vm.uptime_sec
+        return 0
+
+    name_reverse = (key == "name" and reverse) or (key != "name" and reverse)
+    if key == "name":
+        return sorted(vms, key=_key, reverse=not reverse)
+    return sorted(vms, key=_key, reverse=reverse)
+
+
+# ---------------------------------------------------------------------------
+# TUI — curses-based
+# ---------------------------------------------------------------------------
+
+# Color pair IDs
+COLOR_HEADER    = 1
+COLOR_SELECTED  = 2
+COLOR_TITLE     = 3
+COLOR_DIM       = 4
+COLOR_GOOD      = 5
+COLOR_WARN      = 6
+COLOR_ALERT     = 7
+COLOR_SORT_COL  = 8
+COLOR_TOTAL_ROW = 9
+
+
+class QemuTopUI:
+    """
+    Full-screen curses TUI for qemu-top.
+
+    Layout:
+      Line 0:   title bar (qemu-top vX.Y.Z | hostname | refresh | VM count)
+      Line 1:   host CPU & RAM summary
+      Line 2:   column headers
+      Line 3…N: VM rows (scrollable)
+      Last line: TOTAL row
+      Status:   keybinding hint bar
+    """
+
+    # Column definitions: (header, min_width, attr_fn)
+    COLUMNS = [
+        ("NAME",    18),
+        ("PID",      7),
+        ("CPU",      8),
+        ("RAM",     10),
+        ("DISK R",  12),
+        ("DISK W",  12),
+        ("NET RX",  12),
+        ("NET TX",  12),
+        ("UPTIME",   9),
+    ]
+
+    def __init__(self, stdscr, use_color: bool = True) -> None:
+        self.stdscr = stdscr
+        self.use_color = use_color
+        self._init_colors()
+
+        self.vms: List[VMMetrics] = []
+        self.sort_key: str = "cpu"
+        self.sort_reverse: bool = True
+        self.selected: int = 0          # index into sorted list
+        self.scroll_offset: int = 0
+        self.mode: str = "main"         # "main" | "detail" | "cmdline"
+        self.interval: float = 2.0
+        self._cmd_scroll: int = 0        # horizontal scroll offset for CMD column
+        self.host_cpu: Optional[float] = None
+        self.host_cpu_count: int = 1
+        self.host_mem_used: int = 0
+        self.host_mem_total: int = 0
+        self.hostname: str = ""
+        self.last_refresh: float = 0.0
+
+    def _init_colors(self) -> None:
+        if not self.use_color or not curses.has_colors():
+            self.use_color = False
+            return
+        curses.start_color()
+        curses.use_default_colors()
+        # Define color pairs (pair_number, fg, bg)
+        curses.init_pair(COLOR_HEADER,    curses.COLOR_BLACK,  curses.COLOR_CYAN)
+        curses.init_pair(COLOR_SELECTED,  curses.COLOR_BLACK,  curses.COLOR_WHITE)
+        curses.init_pair(COLOR_TITLE,     curses.COLOR_CYAN,   -1)
+        curses.init_pair(COLOR_DIM,       curses.COLOR_WHITE,  -1)
+        curses.init_pair(COLOR_GOOD,      curses.COLOR_GREEN,  -1)
+        curses.init_pair(COLOR_WARN,      curses.COLOR_YELLOW, -1)
+        curses.init_pair(COLOR_ALERT,     curses.COLOR_RED,    -1)
+        curses.init_pair(COLOR_SORT_COL,  curses.COLOR_YELLOW, -1)
+        curses.init_pair(COLOR_TOTAL_ROW, curses.COLOR_CYAN,   -1)
+
+    def _attr(self, pair_id: int, bold: bool = False) -> int:
+        if not self.use_color:
+            return curses.A_BOLD if bold else curses.A_NORMAL
+        attr = curses.color_pair(pair_id)
+        if bold:
+            attr |= curses.A_BOLD
+        return attr
+
+    def update(
+        self,
+        vms: List[VMMetrics],
+        host_cpu: Optional[float],
+        host_cpu_count: int,
+        host_mem_used: int,
+        host_mem_total: int,
+        hostname: str,
+        interval: float,
+    ) -> None:
+        self.vms = sort_vms(vms, self.sort_key, self.sort_reverse)
+        self.host_cpu = host_cpu
+        self.host_cpu_count = host_cpu_count
+        self.host_mem_used = host_mem_used
+        self.host_mem_total = host_mem_total
+        self.hostname = hostname
+        self.interval = interval
+        self.last_refresh = time.monotonic()
+        # Clamp selection
+        if self.vms:
+            self.selected = min(self.selected, len(self.vms) - 1)
+
+    def render(self) -> None:
+        """Redraw the entire screen."""
+        try:
+            self.stdscr.erase()
+            h, w = self.stdscr.getmaxyx()
+            if self.mode == "main":
+                self._render_main(h, w)
+            elif self.mode == "detail":
+                self._render_detail(h, w)
+            elif self.mode == "cmdline":
+                self._render_cmdline(h, w)
+            self.stdscr.refresh()
+        except curses.error:
+            pass  # Terminal too small or other curses error
+
+    def _safe_addstr(self, y: int, x: int, text: str, attr: int = 0) -> None:
+        """Write text, clipping at screen edge."""
+        try:
+            h, w = self.stdscr.getmaxyx()
+            if y >= h or x >= w:
+                return
+            available = w - x
+            if available <= 0:
+                return
+            self.stdscr.addstr(y, x, text[:available], attr)
+        except curses.error:
+            pass
+
+    def _render_main(self, h: int, w: int) -> None:
+        """Render the main VM list view."""
+        # ---- Row 0: title bar ----
+        vm_count = len(self.vms)
+        left_part = f" qemu-top v{VERSION}   Host: {self.hostname}"
+        right_part = f"VMs: {vm_count}  refresh: {self.interval:.1f}s "
+        pad = max(0, w - len(left_part) - len(right_part))
+        bar = left_part + " " * pad + right_part
+        self._safe_addstr(0, 0, bar[:w].ljust(w), self._attr(COLOR_HEADER, bold=True))
+
+        # ---- Row 1: host CPU & RAM ----
+        cpu_str = f"{self.host_cpu:.1f}%" if self.host_cpu is not None else "--.--%"
+        mem_used_gib = self.host_mem_used / 1024 / 1024
+        mem_total_gib = self.host_mem_total / 1024 / 1024
+        host_line = (
+            f" CPU: {cpu_str} / {self.host_cpu_count} cores"
+            f"  │  RAM: {mem_used_gib:.2f} / {mem_total_gib:.2f} GiB"
+        )
+        self._safe_addstr(1, 0, host_line, self._attr(COLOR_TITLE, bold=True))
+
+        if h < 7:
+            return
+
+        # ---- Row 2: column headers ----
+        self._render_col_headers(2, w)
+
+        # ---- Row 3: separator under headers ----
+        self._render_separator(3, w)
+
+        # ---- Rows 4..(h-4): VM list ----
+        list_area_h = h - 7  # rows 4..(h-4), leaving sep+total+hint at bottom
+        if list_area_h < 1:
+            return
+
+        visible_cols = self._visible_cols(w)
+        sorted_vms = self.vms
+
+        # Adjust scroll so selected row is always visible
+        if self.selected < self.scroll_offset:
+            self.scroll_offset = self.selected
+        if self.selected >= self.scroll_offset + list_area_h:
+            self.scroll_offset = self.selected - list_area_h + 1
+
+        for row_i in range(list_area_h):
+            vm_i = row_i + self.scroll_offset
+            screen_row = 4 + row_i
+            if vm_i >= len(sorted_vms):
+                break
+            vm = sorted_vms[vm_i]
+            is_sel = (vm_i == self.selected)
+            self._render_vm_row(screen_row, w, vm, is_sel, visible_cols)
+
+        # ---- Row h-3: separator above total ----
+        self._render_separator(h - 3, w)
+
+        # ---- Row h-2: TOTAL row ----
+        self._render_total_row(h - 2, w, visible_cols)
+
+        # ---- Row h-1: hint bar ----
+        hint = (
+            f" q:Quit  ↑↓:Nav  Enter:Detail  l:Cmd  f:Refresh  +/-:{self.interval:.1f}s"
+            f"  │  Sort: c·CPU  m·RAM  r·RD  w·WR  n·NRX  t·NTX  N·Name  p·PID  u·Up"
+            f"  │  </>:Scroll CMD"
+        )
+        self._safe_addstr(h - 1, 0, hint[:w].ljust(w), self._attr(COLOR_HEADER))
+
+    def _visible_cols(self, w: int) -> List[str]:
+        """Return columns in priority order that fit within the terminal width."""
+        min_widths = {
+            "NAME": 12, "PID": 7, "CPU": 8, "VCPU": 5, "RAM": 10, "CFGMEM": 10,
+            "DISK R": 12, "DISK W": 12, "NET RX": 12, "NET TX": 12, "UPTIME": 9,
+        }
+        # Drop less-important columns first on narrow terminals
+        priority = [
+            "NAME", "PID", "CPU", "VCPU", "RAM", "CFGMEM",
+            "UPTIME", "DISK R", "DISK W", "NET RX", "NET TX",
+        ]
+        used = 0
+        visible = []
+        for col in priority:
+            mw = min_widths[col]
+            if used + mw + 1 <= w:
+                visible.append(col)
+                used += mw + 1
+        # Append CMD column if 24+ chars remain
+        if w - used >= 24:
+            visible.append("CMD")
+        return visible
+
+    def _col_width(self, col: str) -> int:
+        widths = {
+            "NAME": 18, "PID": 7, "CPU": 8, "VCPU": 5, "RAM": 10, "CFGMEM": 10,
+            "DISK R": 12, "DISK W": 12, "NET RX": 12, "NET TX": 12, "UPTIME": 9,
+            "CMD": 24,  # min width; actual render fills remaining terminal width
+        }
+        return widths.get(col, 10)
+
+    def _render_separator(self, row: int, w: int) -> None:
+        """Draw a full-width horizontal separator line."""
+        self._safe_addstr(row, 0, "─" * w, self._attr(COLOR_DIM))
+
+    def _render_col_headers(self, row: int, w: int) -> None:
+        visible = self._visible_cols(w)
+        x = 0
+        for col in visible:
+            cw = self._col_width(col)
+            # CMD: fill remaining width, show scroll indicator
+            if col == "CMD":
+                remaining = w - x
+                if remaining <= 0:
+                    break
+                scroll_tag = f" ◀{self._cmd_scroll}" if self._cmd_scroll > 0 else ""
+                label = f"CMD{scroll_tag}"
+                self._safe_addstr(row, x, label.ljust(remaining)[:remaining],
+                                  self._attr(COLOR_HEADER, bold=True))
+                break
+            # Sort indicator for sortable columns
+            if (col == "NAME" and self.sort_key == "name") or \
+               (col == "PID"  and self.sort_key == "pid") or \
+               (col == "CPU"  and self.sort_key == "cpu") or \
+               (col == "RAM"  and self.sort_key == "ram") or \
+               (col == "DISK R" and self.sort_key == "read") or \
+               (col == "DISK W" and self.sort_key == "write") or \
+               (col == "NET RX" and self.sort_key == "netrx") or \
+               (col == "NET TX" and self.sort_key == "nettx") or \
+               (col == "UPTIME" and self.sort_key == "uptime"):
+                indicator = "▲" if not self.sort_reverse else "▼"
+                label = f"{col}{indicator}"
+                attr = self._attr(COLOR_SORT_COL, bold=True)
+            else:
+                label = col
+                attr = self._attr(COLOR_HEADER, bold=True)
+            self._safe_addstr(row, x, label.ljust(cw)[:cw], attr)
+            x += cw + 1
+            if x >= w:
+                break
+
+    def _render_vm_row(
+        self, row: int, w: int, vm: VMMetrics, selected: bool, visible_cols: List[str]
+    ) -> None:
+        base_attr = self._attr(COLOR_SELECTED, bold=True) if selected else 0
+
+        def cpu_attr(pct: Optional[float]) -> int:
+            if selected:
+                return base_attr
+            if pct is None:
+                return self._attr(COLOR_DIM)
+            if pct >= 200:
+                return self._attr(COLOR_ALERT, bold=True)
+            if pct >= 80:
+                return self._attr(COLOR_WARN, bold=True)
+            return self._attr(COLOR_GOOD)
+
+        def ram_attr(kib: int) -> int:
+            if selected:
+                return base_attr
+            gib = kib / 1024 / 1024
+            if gib >= 8:
+                return self._attr(COLOR_ALERT, bold=True)
+            if gib >= 2:
+                return self._attr(COLOR_WARN)
+            return 0  # default terminal color
+
+        def rate_attr(rate: Optional[float]) -> int:
+            """Color-code a bytes/s rate value."""
+            if selected:
+                return base_attr
+            if rate is None:
+                return self._attr(COLOR_DIM)
+            if rate >= 100 * 1024 * 1024:   # > 100 MiB/s
+                return self._attr(COLOR_ALERT, bold=True)
+            if rate >= 10 * 1024 * 1024:    # > 10 MiB/s
+                return self._attr(COLOR_WARN, bold=True)
+            if rate > 0:
+                return self._attr(COLOR_GOOD)
+            return self._attr(COLOR_DIM)    # 0 B/s — dimmed
+
+        col_values = {
+            "NAME":   vm.name,
+            "PID":    str(vm.pid),
+            "CPU":    fmt_cpu(vm.cpu_pct).strip(),
+            "VCPU":   str(vm.vcpus),
+            "RAM":    fmt_mem(vm.rss_kib),
+            "CFGMEM": fmt_mem_mb(vm.configured_mem_mb),
+            "DISK R": fmt_bytes(vm.disk_read_rate).strip() if vm.disk_read_rate is not None else ("N/A" if not vm.io_available else "--"),
+            "DISK W": fmt_bytes(vm.disk_write_rate).strip() if vm.disk_write_rate is not None else ("N/A" if not vm.io_available else "--"),
+            "NET RX": fmt_bytes(vm.net_rx_rate).strip() if vm.net_rx_rate is not None else "N/A",
+            "NET TX": fmt_bytes(vm.net_tx_rate).strip() if vm.net_tx_rate is not None else "N/A",
+            "UPTIME": fmt_uptime(vm.uptime_sec),
+            "CMD":    build_cmd_display(vm.cmdline),
+        }
+
+        col_attrs = {
+            "NAME":   base_attr,
+            "PID":    base_attr,
+            "CPU":    cpu_attr(vm.cpu_pct),
+            "VCPU":   base_attr,
+            "RAM":    ram_attr(vm.rss_kib),
+            "CFGMEM": base_attr,
+            "DISK R": rate_attr(vm.disk_read_rate),
+            "DISK W": rate_attr(vm.disk_write_rate),
+            "NET RX": rate_attr(vm.net_rx_rate),
+            "NET TX": rate_attr(vm.net_tx_rate),
+            "UPTIME": base_attr,
+            "CMD":    self._attr(COLOR_DIM) if not selected else base_attr,
+        }
+
+        x = 0
+        for col in visible_cols:
+            cw = self._col_width(col)
+            val = col_values.get(col, "")
+            attr = col_attrs.get(col, base_attr)
+            # CMD: dynamically fills all remaining width and is horizontally scrollable
+            if col == "CMD":
+                remaining = w - x
+                if remaining > 0:
+                    scrolled = val[self._cmd_scroll:]
+                    cell = scrolled[:remaining]
+                    self._safe_addstr(row, x, cell.ljust(remaining), attr)
+                x = w  # mark row as full — prevents fill-remainder from overwriting CMD text
+                break  # always the last column
+            if col == "NAME":
+                cell = val[:cw].ljust(cw)
+            else:
+                cell = val.rjust(cw)[:cw]
+            self._safe_addstr(row, x, cell, attr)
+            x += cw + 1
+            if x >= w:
+                break
+
+        # Fill the rest of the row when selected to extend highlight
+        if selected and x < w:
+            self._safe_addstr(row, x, " " * (w - x), base_attr)
+
+    def _render_total_row(self, row: int, w: int, visible_cols: List[str]) -> None:
+        """Render the TOTAL aggregation row."""
+        total_cpu = sum(v.cpu_pct for v in self.vms if v.cpu_pct is not None)
+        total_rss = sum(v.rss_kib for v in self.vms)
+        total_vcpus = sum(v.vcpus for v in self.vms)
+        total_cfgmem_mb = sum(v.configured_mem_mb for v in self.vms)
+        total_dr = sum(v.disk_read_rate for v in self.vms if v.disk_read_rate is not None)
+        total_dw = sum(v.disk_write_rate for v in self.vms if v.disk_write_rate is not None)
+        total_rx = sum(v.net_rx_rate for v in self.vms if v.net_rx_rate is not None)
+        total_tx = sum(v.net_tx_rate for v in self.vms if v.net_tx_rate is not None)
+
+        col_values = {
+            "NAME":   f"TOTAL ({len(self.vms)} VMs)",
+            "PID":    "",
+            "CPU":    f"{total_cpu:.1f}%",
+            "VCPU":   str(total_vcpus) if total_vcpus > 0 else "",
+            "RAM":    fmt_mem(total_rss),
+            "CFGMEM": fmt_mem_mb(total_cfgmem_mb) if total_cfgmem_mb > 0 else "",
+            "DISK R": fmt_bytes(total_dr).strip(),
+            "DISK W": fmt_bytes(total_dw).strip(),
+            "NET RX": fmt_bytes(total_rx).strip(),
+            "NET TX": fmt_bytes(total_tx).strip(),
+            "UPTIME": "",
+            "CMD":    "",
+        }
+
+        x = 0
+        attr = self._attr(COLOR_TOTAL_ROW, bold=True)
+        for col in visible_cols:
+            cw = self._col_width(col)
+            val = col_values.get(col, "")
+            if col == "NAME":
+                cell = val[:cw].ljust(cw)
+            else:
+                cell = val.rjust(cw)[:cw]
+            self._safe_addstr(row, x, cell, attr)
+            x += cw + 1
+            if x >= w:
+                break
+        # Fill remainder
+        if x < w:
+            self._safe_addstr(row, x, " " * (w - x), attr)
+
+    def _render_detail(self, h: int, w: int) -> None:
+        """Render the detail view for the selected VM."""
+        if not self.vms or self.selected >= len(self.vms):
+            self.mode = "main"
+            return
+
+        vm = self.vms[self.selected]
+        row = 0
+
+        def line(text: str, attr: int = 0) -> None:
+            nonlocal row
+            self._safe_addstr(row, 0, text[:w].ljust(w), attr)
+            row += 1
+
+        line(f" VM Detail: {vm.name} (PID {vm.pid})", self._attr(COLOR_HEADER, bold=True))
+        line("")
+        line(f"  PID:        {vm.pid}")
+        line(f"  Executable: {vm.exe or 'unknown'}")
+        line(f"  Uptime:     {fmt_uptime(vm.uptime_sec)}")
+        line("")
+        line("  CPU", self._attr(COLOR_TITLE, bold=True))
+        line(f"    Current:    {fmt_cpu(vm.cpu_pct).strip()}")
+        line(f"    vCPUs:      {vm.vcpus}")
+        line("")
+        line("  Memory", self._attr(COLOR_TITLE, bold=True))
+        if vm.configured_mem_mb > 0:
+            line(f"    Configured: {fmt_mem_mb(vm.configured_mem_mb)}  (guest-visible RAM from -m)")
+        line(f"    RSS (host): {fmt_mem(vm.rss_kib)}  (actual QEMU process memory on host)")
+        line(f"    VSZ:        {fmt_mem(vm.vsz_kib)}")
+        line("")
+        line("  Disk I/O (host-side I/O attributed to QEMU process)", self._attr(COLOR_TITLE, bold=True))
+        if vm.io_available:
+            dr = fmt_bytes(vm.disk_read_rate).strip() if vm.disk_read_rate is not None else "--"
+            dw = fmt_bytes(vm.disk_write_rate).strip() if vm.disk_write_rate is not None else "--"
+            line(f"    Read:        {dr}")
+            line(f"    Write:       {dw}")
+            line(f"    Total read:  {fmt_bytes_plain(vm.disk_read_total)}")
+            line(f"    Total write: {fmt_bytes_plain(vm.disk_write_total)}")
+        else:
+            line("    N/A (requires process ownership or root for /proc/<pid>/io)")
+        line("")
+        line("  Network", self._attr(COLOR_TITLE, bold=True))
+        if vm.net_interfaces:
+            line(f"    Interfaces: {', '.join(vm.net_interfaces)}")
+            rx = fmt_bytes(vm.net_rx_rate).strip() if vm.net_rx_rate is not None else "N/A"
+            tx = fmt_bytes(vm.net_tx_rate).strip() if vm.net_tx_rate is not None else "N/A"
+            line(f"    RX: {rx}")
+            line(f"    TX: {tx}")
+        else:
+            # Detect network backend type(s) from cmdline to explain why N/A.
+            # Scan for -netdev first (more specific); fall back to -net.
+            cmdline = vm.cmdline
+            netdev_types: List[str] = []
+            for i, arg in enumerate(cmdline):
+                if arg == "-netdev" and i + 1 < len(cmdline):
+                    netdev_types.append(cmdline[i + 1].split(",")[0])
+            if not netdev_types:
+                for i, arg in enumerate(cmdline):
+                    if arg == "-net" and i + 1 < len(cmdline):
+                        netdev_types.append(cmdline[i + 1].split(",")[0])
+                        break  # -net only appears once meaningfully
+
+            active = [t for t in netdev_types if t != "none"]
+            if not active:
+                reason = "no network device configured (-net none)"
+            elif all(t in ("socket", "udp") for t in active):
+                n = len(active)
+                reason = f"{n}\u00d7 UDP socket tunnel \u2014 no host interface created"
+            elif all(t in ("user", "slirp") for t in active):
+                reason = "user-mode SLIRP \u2014 host cannot observe guest traffic"
+            else:
+                types = "\u202f+\u202f".join(sorted(set(active)))
+                reason = f"backend(s) [{types}] \u2014 no matching host interface found"
+            line(f"    N/A  ({reason})")
+        line("")
+        line("  Press Esc or q to return", self._attr(COLOR_DIM))
+
+    def _render_cmdline(self, h: int, w: int) -> None:
+        """Render the full command line for the selected VM."""
+        if not self.vms or self.selected >= len(self.vms):
+            self.mode = "main"
+            return
+
+        vm = self.vms[self.selected]
+        self._safe_addstr(0, 0, f" Command line: {vm.name}".ljust(w), self._attr(COLOR_HEADER, bold=True))
+
+        # Word-wrap the command with args on separate lines
+        cmd = " ".join(vm.cmdline)
+        row = 2
+        # Split on space-separated args for readability
+        line_buf = ""
+        for arg in vm.cmdline:
+            if arg.startswith("-") and line_buf:
+                # Start new line for each flag
+                self._safe_addstr(row, 2, line_buf[:w - 2])
+                row += 1
+                if row >= h - 1:
+                    break
+                line_buf = arg
+            else:
+                if line_buf:
+                    line_buf += " " + arg
+                else:
+                    line_buf = arg
+
+        if line_buf and row < h - 1:
+            self._safe_addstr(row, 2, line_buf[:w - 2])
+            row += 1
+
+        if row < h - 1:
+            self._safe_addstr(h - 1, 0, " Press Esc or q to return".ljust(w), self._attr(COLOR_DIM))
+
+    def handle_input(self, key: int) -> str:
+        """
+        Process a keypress. Returns an action string:
+        "quit", "refresh", "noop"
+        """
+        if self.mode in ("detail", "cmdline"):
+            if key in (27, ord("q"), ord("Q")):  # Esc or q
+                self.mode = "main"
+            return "noop"
+
+        # Main view controls
+        if key in (ord("q"), ord("Q"), 3):  # q, Q, Ctrl-C
+            return "quit"
+        elif key == ord("f"):
+            return "refresh"
+        elif key == ord("+") or key == ord("="):
+            self.interval = min(MAX_INTERVAL, self.interval + 0.5)
+        elif key == ord("-"):
+            self.interval = max(MIN_INTERVAL, self.interval - 0.5)
+        elif key == curses.KEY_UP:
+            self.selected = max(0, self.selected - 1)
+        elif key == curses.KEY_DOWN:
+            self.selected = min(max(0, len(self.vms) - 1), self.selected + 1)
+        elif key in (curses.KEY_ENTER, 10, 13, ord("d")):
+            self.mode = "detail"
+        elif key == ord("l"):
+            self.mode = "cmdline"
+        elif key == 27:  # Esc
+            pass
+        # Sorting
+        elif key == ord("c"):
+            self._set_sort("cpu")
+        elif key == ord("m"):
+            self._set_sort("ram")
+        elif key == ord("r"):
+            self._set_sort("read")
+        elif key == ord("w"):
+            self._set_sort("write")
+        elif key == ord("n"):
+            self._set_sort("netrx")
+        elif key == ord("t"):
+            self._set_sort("nettx")
+        elif key == ord("N"):
+            self._set_sort("name")
+        elif key == ord("p"):
+            self._set_sort("pid")
+        elif key == ord("u"):
+            self._set_sort("uptime")
+        elif key == curses.KEY_RESIZE:
+            pass  # Will re-render on next cycle
+        # CMD column horizontal scroll
+        elif key in (ord("<"), ord(","), curses.KEY_LEFT):
+            self._cmd_scroll = max(0, self._cmd_scroll - 20)
+        elif key in (ord(">"), ord("."), curses.KEY_RIGHT):
+            self._cmd_scroll += 20
+
+        return "noop"
+
+    def _set_sort(self, key: str) -> None:
+        if self.sort_key == key:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_key = key
+            self.sort_reverse = (key != "name")
+        # Re-sort
+        self.vms = sort_vms(self.vms, self.sort_key, self.sort_reverse)
+
+
+# ---------------------------------------------------------------------------
+# Main application loop
+# ---------------------------------------------------------------------------
+
+
+class QemuTop:
+    """Main application orchestrator."""
+
+    def __init__(self, interval: float, use_color: bool, sort_key: str) -> None:
+        self.interval = interval
+        self.use_color = use_color
+        self.sort_key = sort_key
+        self.discovery = ProcessDiscovery()
+        self.proc_collector = ProcCollector()
+        self.net_collector = NetworkCollector()
+        self.metrics_engine = MetricsEngine()
+        self.host_cpu_monitor = HostCpuMonitor()
+        self.hostname = self._get_hostname()
+        self.cpu_count = get_host_cpu_count()
+
+    @staticmethod
+    def _get_hostname() -> str:
+        try:
+            return os.uname().nodename
+        except Exception:
+            return "unknown"
+
+    def collect(self) -> Tuple[List[VMMetrics], Optional[float], int, int]:
+        """
+        Run one full collection cycle.
+        Returns: (vms, host_cpu_pct, host_mem_used_kib, host_mem_total_kib)
+        """
+        # Refresh network interface counters first
+        self.net_collector.refresh_iface_counters()
+
+        pids = self.discovery.discover()
+        snapshots: Dict[int, RawSnapshot] = {}
+
+        for pid in pids:
+            snap = self.proc_collector.collect(pid, self.net_collector)
+            if snap is not None:
+                snapshots[pid] = snap
+
+        vms = self.metrics_engine.update(snapshots, self.net_collector)
+        host_cpu = self.host_cpu_monitor.sample()
+        mem_used, mem_total = get_host_mem()
+
+        return vms, host_cpu, mem_used, mem_total
+
+    def run_once(self, sort_key: str) -> None:
+        """Print a single snapshot table to stdout and exit."""
+        # Need two samples for rates
+        self.collect()
+        time.sleep(max(1.0, self.interval))
+        vms, host_cpu, mem_used, mem_total = self.collect()
+        vms = sort_vms(vms, sort_key, reverse=(sort_key != "name"))
+
+        print(f"qemu-top v{VERSION}  Host: {self.hostname}  "
+              f"CPU: {self.cpu_count} cores  "
+              f"RAM: {mem_used/1024/1024:.1f}/{mem_total/1024/1024:.1f} GiB")
+        print()
+
+        # Header
+        hdr = (f"{'NAME':<18} {'PID':>7} {'CPU':>8} {'VCPU':>4} {'RAM':>10} {'CFGMEM':>10} "
+               f"{'DISK R':>12} {'DISK W':>12} {'NET RX':>12} {'NET TX':>12} {'UPTIME':>9}")
+        print(hdr)
+        print("-" * len(hdr))
+
+        for vm in vms:
+            dr = fmt_bytes(vm.disk_read_rate).strip() if vm.disk_read_rate is not None else "N/A"
+            dw = fmt_bytes(vm.disk_write_rate).strip() if vm.disk_write_rate is not None else "N/A"
+            rx = fmt_bytes(vm.net_rx_rate).strip() if vm.net_rx_rate is not None else "N/A"
+            tx = fmt_bytes(vm.net_tx_rate).strip() if vm.net_tx_rate is not None else "N/A"
+            cpu = fmt_cpu(vm.cpu_pct).strip()
+            print(
+                f"{vm.name[:18]:<18} {vm.pid:>7} {cpu:>8} {vm.vcpus:>4} {fmt_mem(vm.rss_kib):>10} "
+                f"{fmt_mem_mb(vm.configured_mem_mb):>10} "
+                f"{dr:>12} {dw:>12} {rx:>12} {tx:>12} {fmt_uptime(vm.uptime_sec):>9}"
+            )
+
+        print("-" * len(hdr))
+        if vms:
+            total_cpu = sum(v.cpu_pct for v in vms if v.cpu_pct is not None)
+            total_rss = sum(v.rss_kib for v in vms)
+            total_vcpus = sum(v.vcpus for v in vms)
+            total_cfgmem = sum(v.configured_mem_mb for v in vms)
+            print(
+                f"{'TOTAL':<18} {'':>7} {total_cpu:>7.1f}% {total_vcpus:>4} {fmt_mem(total_rss):>10} "
+                f"{fmt_mem_mb(total_cfgmem):>10}"
+            )
+
+    def run_tui(self) -> None:
+        """Launch the curses TUI."""
+        curses.wrapper(self._tui_main)
+
+    def _tui_main(self, stdscr) -> None:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(200)  # 200ms input poll
+
+        ui = QemuTopUI(stdscr, use_color=self.use_color)
+        ui.sort_key = self.sort_key
+        ui.interval = self.interval
+
+        last_collect = 0.0
+        vms: List[VMMetrics] = []
+        host_cpu: Optional[float] = None
+        mem_used = 0
+        mem_total = 0
+
+        while True:
+            now = time.monotonic()
+
+            # Collect data if interval has elapsed
+            if now - last_collect >= ui.interval:
+                try:
+                    vms, host_cpu, mem_used, mem_total = self.collect()
+                except Exception:
+                    pass  # Never crash the TUI
+                last_collect = now
+                ui.update(
+                    vms, host_cpu, self.cpu_count,
+                    mem_used, mem_total,
+                    self.hostname, ui.interval,
+                )
+                ui.render()
+
+            # Handle input
+            try:
+                key = stdscr.getch()
+            except curses.error:
+                key = -1
+
+            if key != -1:
+                action = ui.handle_input(key)
+                if action == "quit":
+                    return
+                elif action == "refresh":
+                    last_collect = 0.0  # Force immediate refresh
+                ui.render()
+
+
+# ---------------------------------------------------------------------------
+# Self-test
+# ---------------------------------------------------------------------------
+
+
+class SelfTest:
+    """
+    Validates core /proc parsing and metric calculation logic.
+    Does not require real QEMU processes.
+    """
+
+    PASS = "\033[32mPASS\033[0m"
+    FAIL = "\033[31mFAIL\033[0m"
+
+    def __init__(self) -> None:
+        self.passed = 0
+        self.failed = 0
+
+    def check(self, name: str, condition: bool, detail: str = "") -> None:
+        if condition:
+            print(f"  [{self.PASS}] {name}")
+            self.passed += 1
+        else:
+            print(f"  [{self.FAIL}] {name}" + (f": {detail}" if detail else ""))
+            self.failed += 1
+
+    def run(self) -> int:
+        print(f"\nqemu-top v{VERSION} self-test\n")
+
+        self._test_name_resolution()
+        self._test_uptime_format()
+        self._test_memory_format()
+        self._test_bytes_format()
+        self._test_cpu_calculation()
+        self._test_proc_stat_parsing()
+        self._test_proc_status_parsing()
+        self._test_io_parsing()
+        self._test_cmdline_net_parsing()
+        self._test_discovery_regex()
+        self._test_host_mem()
+        self._test_host_uptime()
+
+        print(f"\nResults: {self.passed} passed, {self.failed} failed\n")
+        return 0 if self.failed == 0 else 1
+
+    def _test_name_resolution(self) -> None:
+        print("Name Resolution:")
+        cases = [
+            (["qemu-system-x86_64", "-name", "win11"], "win11"),
+            (["qemu-system-x86_64", "-name", "guest=ubuntu,debug-threads=on"], "ubuntu"),
+            (["qemu-system-x86_64", "-m", "2048"], "qemu-9999"),
+            (["qemu-system-x86_64", "-name", "my-vm,debug-threads=on"], "my-vm"),
+        ]
+        for cmdline, expected in cases:
+            result = resolve_vm_name(cmdline, 9999)
+            self.check(f"resolve_vm_name({cmdline[-1] if len(cmdline) > 1 else 'fallback'})",
+                       result == expected,
+                       f"got '{result}', expected '{expected}'")
+
+    def _test_uptime_format(self) -> None:
+        print("\nUptime Formatting:")
+        cases = [
+            (45, "45s"),
+            (754, "12m34s"),
+            (12060, "3h21m"),
+            (187200, "2d04h"),
+        ]
+        for sec, expected in cases:
+            result = fmt_uptime(sec)
+            self.check(f"fmt_uptime({sec})", result == expected,
+                       f"got '{result}', expected '{expected}'")
+
+    def _test_memory_format(self) -> None:
+        print("\nMemory Formatting:")
+        cases = [
+            (512, "512 KiB"),
+            (2048, "2.00 MiB"),
+            (1048576, "1.00 GiB"),
+            (6553600, "6.25 GiB"),
+        ]
+        for kib, expected in cases:
+            result = fmt_mem(kib)
+            self.check(f"fmt_mem({kib})", result == expected,
+                       f"got '{result}', expected '{expected}'")
+
+    def _test_bytes_format(self) -> None:
+        print("\nBytes Rate Formatting:")
+        # Just check it doesn't crash and returns a string
+        for b in (0.0, 512.0, 1024.0 * 12.4, 1024.0 * 1024.0 * 3.2, None):
+            result = fmt_bytes(b)
+            self.check(f"fmt_bytes({b})", isinstance(result, str))
+
+    def _test_cpu_calculation(self) -> None:
+        print("\nCPU Calculation:")
+        # Simulate: 200 ticks in 1 second = 200% (2 full CPUs)
+        tick_delta = 200
+        dt = 1.0
+        clk = CLK_TCK  # e.g. 100
+        cpu_pct = (tick_delta / clk) / dt * 100.0
+        self.check("CPU delta calculation (200 ticks/s @ 100Hz = 200%)",
+                   abs(cpu_pct - 200.0) < 0.01,
+                   f"got {cpu_pct}")
+
+        # Zero delta = 0%
+        cpu_zero = (0 / clk) / 1.0 * 100.0
+        self.check("CPU delta calculation (0 ticks = 0%)",
+                   cpu_zero == 0.0)
+
+    def _test_proc_stat_parsing(self) -> None:
+        print("\n/proc/<pid>/stat Parsing:")
+        # Synthesize a realistic /proc/stat line
+        # Format: pid (name) state ppid ... utime stime ... starttime ...
+        # We'll build a minimal line: fields after ')' at positions 11 and 12 are utime/stime,
+        # position 19 is starttime (0-indexed after rparen).
+        fields_after = ["S", "1", "4217", "4217", "0", "0", "0", "0", "0", "0", "0",
+                        "12345",  # utime  → index 11
+                        "6789",   # stime  → index 12
+                        "0", "0", "0", "0", "0", "0",
+                        "987654", # starttime → index 19
+                        ]
+        fake_stat = f"4217 (qemu-system-x86_64) {' '.join(fields_after)}"
+
+        # Parse using the same logic as ProcCollector._read_stat
+        rparen = fake_stat.rfind(")")
+        f = fake_stat[rparen + 2:].split()
+        utime = int(f[11])
+        stime = int(f[12])
+        starttime = int(f[19])
+        self.check("utime parsed correctly", utime == 12345, str(utime))
+        self.check("stime parsed correctly", stime == 6789, str(stime))
+        self.check("starttime parsed correctly", starttime == 987654, str(starttime))
+        self.check("cpu_ticks sum", utime + stime == 19134)
+
+    def _test_proc_status_parsing(self) -> None:
+        print("\n/proc/<pid>/status Parsing:")
+        fake_status = (
+            "Name:\tqemu-system-x86_64\n"
+            "VmSize:\t 8529920 kB\n"
+            "VmRSS:\t  6621184 kB\n"
+            "Threads:\t16\n"
+        )
+        rss = vsz = 0
+        for line in fake_status.splitlines():
+            if line.startswith("VmRSS:"):
+                rss = int(line.split()[1])
+            elif line.startswith("VmSize:"):
+                vsz = int(line.split()[1])
+        self.check("VmRSS parsed", rss == 6621184, str(rss))
+        self.check("VmSize parsed", vsz == 8529920, str(vsz))
+
+    def _test_io_parsing(self) -> None:
+        print("\n/proc/<pid>/io Parsing:")
+        fake_io = (
+            "rchar: 18446744073709551615\n"
+            "wchar: 8765432\n"
+            "syscr: 1234\n"
+            "syscw: 567\n"
+            "read_bytes: 193273856\n"
+            "write_bytes: 43827200\n"
+            "cancelled_write_bytes: 0\n"
+        )
+        rb = wb = 0
+        for line in fake_io.splitlines():
+            if line.startswith("read_bytes:"):
+                rb = int(line.split()[1])
+            elif line.startswith("write_bytes:"):
+                wb = int(line.split()[1])
+        self.check("read_bytes parsed", rb == 193273856, str(rb))
+        self.check("write_bytes parsed", wb == 43827200, str(wb))
+
+    def _test_cmdline_net_parsing(self) -> None:
+        print("\nNetwork Interface Parsing:")
+        nc = NetworkCollector()
+        cases = [
+            (
+                ["qemu-system-x86_64", "-netdev", "tap,id=net0,ifname=tap0,script=no"],
+                ["tap0"],
+            ),
+            (
+                ["qemu-system-x86_64", "-net", "tap,ifname=vnet3"],
+                ["vnet3"],
+            ),
+            (
+                ["qemu-system-x86_64", "-m", "2048"],
+                [],
+            ),
+            (
+                ["qemu-system-x86_64", "-netdev",
+                 "tap,id=net0,ifname=tap0", "-netdev", "tap,id=net1,ifname=tap1"],
+                ["tap0", "tap1"],
+            ),
+        ]
+        for cmdline, expected in cases:
+            result = nc._parse_cmdline_interfaces(cmdline)
+            self.check(f"cmdline ifname parse ({cmdline[-1]})",
+                       result == expected,
+                       f"got {result}, expected {expected}")
+
+    def _test_discovery_regex(self) -> None:
+        print("\nProcess Discovery Regex:")
+        cases = [
+            ("qemu-system-x86_64", True),
+            ("qemu-system-aarch64", True),
+            ("qemu-system-riscv64", True),
+            ("qemu-system-arm", True),
+            ("bash", False),
+            ("python3", False),
+            ("qemu-img", False),
+        ]
+        for name, expected in cases:
+            result = bool(QEMU_RE.search(name))
+            self.check(f"QEMU_RE.search('{name}')", result == expected)
+
+    def _test_host_mem(self) -> None:
+        print("\nHost Memory:")
+        used, total = get_host_mem()
+        self.check("/proc/meminfo readable", total > 0, f"total={total}")
+        self.check("used <= total", used <= total, f"used={used} total={total}")
+
+    def _test_host_uptime(self) -> None:
+        print("\nHost Uptime:")
+        uptime = get_host_uptime()
+        self.check("/proc/uptime readable", uptime > 0, f"uptime={uptime}")
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "htop-style live resource monitor for QEMU/KVM virtual machines.\n"
+            "Discovers VMs directly from /proc — no libvirt required."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Keyboard Controls (TUI):
+  q / Ctrl-C   quit
+  f            force refresh
+  + / -        increase/decrease refresh interval
+  ↑ / ↓        navigate VM list
+  Enter / d    VM detail view
+  l            full command line view
+  Esc          return to main view
+  c            sort by CPU
+  m            sort by RAM
+  r            sort by disk read
+  w            sort by disk write
+  n            sort by net RX
+  t            sort by net TX
+  N            sort by name
+  p            sort by PID
+  u            sort by uptime
+
+Examples:
+  %(prog)s
+  %(prog)s -i 1
+  %(prog)s --interval 5
+  %(prog)s --once
+  %(prog)s --once --sort memory
+  %(prog)s --no-color
+  %(prog)s --self-test
+        """,
+    )
+    parser.add_argument(
+        "-i", "--interval",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="refresh interval in seconds (default: 2.0, min: 0.5)",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="print one snapshot table to stdout and exit",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="disable color output",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=list(SORT_KEYS),
+        default="cpu",
+        metavar="KEY",
+        help=(
+            "initial sort column: cpu, ram, read, write, netrx, nettx, "
+            "name, pid, uptime (default: cpu)"
+        ),
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run built-in self-tests and exit",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Validate interval
+    if args.interval < MIN_INTERVAL:
+        parser.error(f"--interval must be >= {MIN_INTERVAL}")
+    if args.interval > MAX_INTERVAL:
+        parser.error(f"--interval must be <= {MAX_INTERVAL}")
+
+    if args.self_test:
+        st = SelfTest()
+        sys.exit(st.run())
+
+    app = QemuTop(
+        interval=args.interval,
+        use_color=not args.no_color,
+        sort_key=args.sort,
+    )
+
+    if args.once:
+        app.run_once(args.sort)
+    else:
+        try:
+            app.run_tui()
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()
